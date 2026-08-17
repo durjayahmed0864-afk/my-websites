@@ -972,7 +972,7 @@ And He is Allah, [the only deity] in the heavens and the earth. He knows your se
   }
 
   /* ===== likePost / dislikePost / addComment are now defined in the
-     Firebase module script below, and attached to window so the
+     Supabase module script below, and attached to window so the
      onclick="" handlers above can still find them. ===== */
 
   function openComments(id) {
@@ -1023,27 +1023,16 @@ And He is Allah, [the only deity] in the heavens and the earth. He knows your se
   renderBlogPosts();
 </script>
 
-<!-- ===== Firebase: persists likes / dislikes / comments to Firestore ===== -->
+<!-- ===== Supabase: persists likes / dislikes / comments to Postgres ===== -->
 <script type="module">
-  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-  import {
-    getFirestore, doc, getDoc, setDoc, runTransaction,
-    collection, addDoc, onSnapshot, query, orderBy, serverTimestamp
-  } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+  import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm";
 
-  const firebaseConfig = {
-    apiKey: "AIzaSyDNDB5tNrSYFRMlRnOj5k-sV_ZO_inZ8HM",
-    authDomain: "my-project-4eeb3.firebaseapp.com",
-    databaseURL: "https://my-project-4eeb3-default-rtdb.firebaseio.com",
-    projectId: "my-project-4eeb3",
-    storageBucket: "my-project-4eeb3.firebasestorage.app",
-    messagingSenderId: "615358852165",
-    appId: "1:615358852165:web:585119b685dec00f33472c",
-    measurementId: "G-4PJ1MJ3CVC"
-  };
+  // ⚠️ নিচের দুইটা লাইনে তোমার নিজের Supabase Project URL আর anon public key বসাও
+  // (Supabase Dashboard → Settings → API থেকে পাবে)
+  const SUPABASE_URL = "https://qmxptvvnihcayumgateb.supabase.co";
+  const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFteHB0dnZuaWhjYXl1bWdhdGViIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY5Njc5NTYsImV4cCI6MjEwMjU0Mzk1Nn0.o99Y4aZaU03ul8ANC9vG4E0NyKvmsFBnw7ikC48guDs";
 
-  const app = initializeApp(firebaseConfig);
-  const db = getFirestore(app);
+  const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
   // localStorage remembers which way THIS browser already voted,
   // so a reload/re-visit doesn't let the same visitor double-vote.
@@ -1057,64 +1046,81 @@ And He is Allah, [the only deity] in the heavens and the earth. He knows your se
     if (dislikeBtn) dislikeBtn.classList.toggle('active', vote === 'dislike');
   }
 
-  // Live counts + live comments for one post
-  function listenToPost(id) {
-    const postRef = doc(db, "posts", String(id));
+  function updateCounts(id, likes, dislikes) {
+    const likeEl = document.getElementById(`like-count-${id}`);
+    const dislikeEl = document.getElementById(`dislike-count-${id}`);
+    if (likeEl) likeEl.textContent = likes || 0;
+    if (dislikeEl) dislikeEl.textContent = dislikes || 0;
+  }
 
-    onSnapshot(postRef, (snap) => {
-      const data = snap.exists() ? snap.data() : { likes: 0, dislikes: 0 };
-      const likeEl = document.getElementById(`like-count-${id}`);
-      const dislikeEl = document.getElementById(`dislike-count-${id}`);
-      if (likeEl) likeEl.textContent = data.likes || 0;
-      if (dislikeEl) dislikeEl.textContent = data.dislikes || 0;
-    }, (err) => console.error(`posts/${id} snapshot error:`, err));
+  async function loadPostCounts(id) {
+    const { data, error } = await supabase
+      .from('posts')
+      .select('likes,dislikes')
+      .eq('id', String(id))
+      .maybeSingle();
+    if (error) { console.error(`posts/${id} load error:`, error); return; }
+    updateCounts(id, data?.likes, data?.dislikes);
+  }
 
-    const commentsQuery = query(
-      collection(db, "posts", String(id), "comments"),
-      orderBy("createdAt", "asc")
-    );
-    onSnapshot(commentsQuery, (snap) => {
-      const list = document.getElementById(`comments-list-${id}`);
-      if (!list) return;
-      list.innerHTML = "";
-      snap.forEach((docSnap) => {
-        const li = document.createElement('li');
-        li.textContent = docSnap.data().text || '';
-        list.appendChild(li);
-      });
-    }, (err) => console.error(`posts/${id}/comments snapshot error:`, err));
+  function appendCommentToList(id, text) {
+    const list = document.getElementById(`comments-list-${id}`);
+    if (!list) return;
+    const li = document.createElement('li');
+    li.textContent = text || '';
+    list.appendChild(li);
+  }
+
+  async function loadComments(id) {
+    const { data, error } = await supabase
+      .from('comments')
+      .select('text')
+      .eq('post_id', String(id))
+      .order('created_at', { ascending: true });
+    if (error) { console.error(`comments/${id} load error:`, error); return; }
+    const list = document.getElementById(`comments-list-${id}`);
+    if (!list) return;
+    list.innerHTML = '';
+    (data || []).forEach((row) => appendCommentToList(id, row.text));
+  }
+
+  // Live updates for one post's likes/dislikes + its comments
+  function subscribeToPost(id) {
+    supabase
+      .channel(`post-${id}`)
+      .on('postgres_changes',
+        { event: '*', schema: 'public', table: 'posts', filter: `id=eq.${id}` },
+        (payload) => updateCounts(id, payload.new.likes, payload.new.dislikes)
+      )
+      .on('postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'comments', filter: `post_id=eq.${id}` },
+        (payload) => appendCommentToList(id, payload.new.text)
+      )
+      .subscribe();
   }
 
   async function vote(id, type) {
-    const ref = doc(db, "posts", String(id));
     const key = voteKey(id);
     const current = localStorage.getItem(key);
+    let deltaLikes = 0, deltaDislikes = 0;
 
-    try {
-      await runTransaction(db, async (tx) => {
-        const snap = await tx.get(ref);
-        const data = snap.exists() ? snap.data() : { likes: 0, dislikes: 0 };
-        let likes = data.likes || 0;
-        let dislikes = data.dislikes || 0;
-
-        if (current === type) {
-          // clicking the same button again removes the vote
-          if (type === 'like') likes = Math.max(0, likes - 1);
-          else dislikes = Math.max(0, dislikes - 1);
-          localStorage.removeItem(key);
-        } else {
-          if (current === 'like') likes = Math.max(0, likes - 1);
-          if (current === 'dislike') dislikes = Math.max(0, dislikes - 1);
-          if (type === 'like') likes++; else dislikes++;
-          localStorage.setItem(key, type);
-        }
-
-        tx.set(ref, { likes, dislikes }, { merge: true });
-      });
-    } catch (e) {
-      console.error("Vote failed:", e);
-      return;
+    if (current === type) {
+      // clicking the same button again removes the vote
+      if (type === 'like') deltaLikes = -1; else deltaDislikes = -1;
+      localStorage.removeItem(key);
+    } else {
+      if (current === 'like') deltaLikes -= 1;
+      if (current === 'dislike') deltaDislikes -= 1;
+      if (type === 'like') deltaLikes += 1; else deltaDislikes += 1;
+      localStorage.setItem(key, type);
     }
+
+    const { error } = await supabase.rpc('adjust_vote', {
+      p_post_id: String(id),
+      p_delta_likes: deltaLikes,
+      p_delta_dislikes: deltaDislikes
+    });
+    if (error) { console.error("Vote failed:", error); return; }
 
     setVoteButtonState(id);
   }
@@ -1129,20 +1135,18 @@ And He is Allah, [the only deity] in the heavens and the earth. He knows your se
     if (!text) return;
     input.value = '';
 
-    try {
-      await addDoc(collection(db, "posts", String(id), "comments"), {
-        text,
-        createdAt: serverTimestamp()
-      });
-    } catch (e) {
-      console.error("Comment failed:", e);
-    }
+    const { error } = await supabase
+      .from('comments')
+      .insert({ post_id: String(id), text });
+    if (error) console.error("Comment failed:", error);
   };
 
   // blogPosts / renderBlogPosts() ran synchronously in the script above,
   // so the post DOM already exists by the time this module runs.
   blogPosts.forEach((p) => {
-    listenToPost(p.id);
+    loadPostCounts(p.id);
+    loadComments(p.id);
+    subscribeToPost(p.id);
     setVoteButtonState(p.id);
   });
 </script>
